@@ -112,9 +112,14 @@ function registerSocketEvents(io) {
 
       const updatedRoom = assignImpostor(roomId)
 
-      // Envoie à chaque joueur son rôle individuellement (secret !)
+      console.log('=== DÉBUT PARTIE ===')
+      console.log('Joueurs :', updatedRoom.players.map(p => `${p.name} (${p.id})`))
+      console.log('Imposteur ID :', updatedRoom.impostorId)
+      console.log('Imposteur nom :', updatedRoom.players.find(p => p.id === updatedRoom.impostorId)?.name)
+
       for (const player of updatedRoom.players) {
         const playerSocket = io.sockets.sockets.get(player.id)
+        console.log(`Envoi à ${player.name} — isImpostor: ${player.id === updatedRoom.impostorId} — socket trouvé: ${!!playerSocket}`)
         if (playerSocket) {
           playerSocket.emit('game:started', {
             room: updatedRoom,
