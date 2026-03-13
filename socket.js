@@ -183,10 +183,14 @@ function registerSocketEvents(io) {
     // Émis par : l'hôte depuis l'écran des scores
     // Reçoit   : { roomId }
     // Émet     : 'round:next' → { room } (à toute la salle)
-    socket.on('round:next', ({ roomId }) => {
+    socket.on('round:next', ({ roomId, hostName }) => {
       const room = getRoom(roomId)
       if (!room) return
-      if (room.hostId !== socket.id) return
+      // Vérifie via socket.id OU via le nom de l'hôte (en cas de reconnexion)
+      const isHost = room.hostId === socket.id || room.hostName === hostName
+      if (!isHost) return
+      // Met à jour l'hostId avec le socket actuel
+      room.hostId = socket.id
 
       const updatedRoom = nextRound(roomId)
       io.to(roomId).emit('round:next', { room: updatedRoom })
