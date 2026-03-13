@@ -61,9 +61,6 @@ function registerSocketEvents(io) {
     console.log(`✅ Connecté : ${socket.id}`)
 
     // ─── CRÉER UNE SALLE ───────────────────────────────────────────
-    // Émis par : l'hôte depuis la page d'accueil
-    // Reçoit   : { playerName }
-    // Émet     : 'room:created' → { room } (à l'hôte uniquement)
     socket.on('room:create', ({ playerName }) => {
       if (!playerName?.trim()) return
 
@@ -74,10 +71,6 @@ function registerSocketEvents(io) {
     })
 
     // ─── REJOINDRE UNE SALLE ───────────────────────────────────────
-    // Émis par : un joueur qui clique sur le lien d'invitation
-    // Reçoit   : { roomId, playerName }
-    // Émet     : 'room:joined'   → { room } (au joueur uniquement)
-    //            'room:updated'  → { room } (à toute la salle)
     socket.on('room:join', ({ roomId, playerName }) => {
       if (!playerName?.trim() || !roomId) return
 
@@ -89,15 +82,11 @@ function registerSocketEvents(io) {
 
       socket.join(roomId)
       socket.emit('room:joined', { room: result.room })
-      // Notifie tous les autres joueurs de la salle
       socket.to(roomId).emit('room:updated', { room: result.room })
       console.log(`👤 ${playerName} a rejoint la salle ${roomId}`)
     })
 
     // ─── LANCER LA PARTIE ──────────────────────────────────────────
-    // Émis par : l'hôte uniquement
-    // Reçoit   : { roomId }
-    // Émet     : 'game:started' → { room, isImpostor } (individuellement à chaque joueur)
     socket.on('game:start', ({ roomId }) => {
       const room = getRoom(roomId)
       if (!room) return
@@ -112,14 +101,8 @@ function registerSocketEvents(io) {
 
       const updatedRoom = assignImpostor(roomId)
 
-      console.log('=== DÉBUT PARTIE ===')
-      console.log('Joueurs :', updatedRoom.players.map(p => `${p.name} (${p.id})`))
-      console.log('Imposteur ID :', updatedRoom.impostorId)
-      console.log('Imposteur nom :', updatedRoom.players.find(p => p.id === updatedRoom.impostorId)?.name)
-
       for (const player of updatedRoom.players) {
         const playerSocket = io.sockets.sockets.get(player.id)
-        console.log(`Envoi à ${player.name} — isImpostor: ${player.id === updatedRoom.impostorId} — socket trouvé: ${!!playerSocket}`)
         if (playerSocket) {
           playerSocket.emit('game:started', {
             room: updatedRoom,
@@ -131,9 +114,6 @@ function registerSocketEvents(io) {
     })
 
     // ─── FIN DE PARTIE RL (bouton hôte) ───────────────────────────
-    // Émis par : l'hôte quand la partie RL est terminée
-    // Reçoit   : { roomId }
-    // Émet     : 'voting:started' → { room } (à toute la salle)
     socket.on('game:end', ({ roomId }) => {
       const room = getRoom(roomId)
       if (!room) return
@@ -145,10 +125,6 @@ function registerSocketEvents(io) {
     })
 
     // ─── VOTER ─────────────────────────────────────────────────────
-    // Émis par : chaque joueur pendant la phase de vote
-    // Reçoit   : { roomId, targetId }
-    // Émet     : 'vote:registered' → { votesCount, totalPlayers } (à toute la salle)
-    //            'reveal:result'   → résultats complets (quand tout le monde a voté)
     socket.on('vote:cast', async ({ roomId, targetId }) => {
       const room = castVote(roomId, socket.id, targetId)
       if (!room) return
@@ -158,37 +134,34 @@ function registerSocketEvents(io) {
 
       io.to(roomId).emit('vote:registered', { votesCount, totalPlayers })
 
-      // Tout le monde a voté → on calcule les résultats
       if (votesCount >= totalPlayers) {
         const results = computeResults(roomId)
-
-        // Sauvegarde les scores dans Supabase
         await saveScores(roomId, results.players, results.pointsAwarded)
-
         io.to(roomId).emit('reveal:result', { results })
         console.log(`📊 Résultats calculés pour la salle ${roomId}`)
       }
     })
 
     // ─── VOIR LES SCORES CUMULÉS ───────────────────────────────────
-    // Émis par : n'importe quel client après la révélation
-    // Reçoit   : { roomId }
-    // Émet     : 'scores:data' → { scores } (au demandeur)
+    // MODIFIÉ : on renvoie aussi la room à jour pour que le frontend
+    // puisse recalculer amHost correctement (room.hostName fiable)
     socket.on('scores:request', async ({ roomId }) => {
       const scores = await getTotalScores(roomId)
-      socket.emit('scores:data', { scores })
+      const room = getRoom(roomId)
+      socket.emit('scores:data', { scores, room })
+      console.log(`📋 Scores demandés pour la salle ${roomId} — hôte : ${room?.hostName}`)
     })
 
     // ─── MANCHE SUIVANTE ───────────────────────────────────────────
-    // Émis par : l'hôte depuis l'écran des scores
-    // Reçoit   : { roomId }
-    // Émet     : 'round:next' → { room } (à toute la salle)
     socket.on('round:next', ({ roomId, hostName }) => {
       const room = getRoom(roomId)
       if (!room) return
       // Vérifie via socket.id OU via le nom de l'hôte (en cas de reconnexion)
       const isHost = room.hostId === socket.id || room.hostName === hostName
-      if (!isHost) return
+      if (!isHost) {
+        console.log(`⛔ round:next refusé — socket: ${socket.id}, hostId: ${room.hostId}, hostName reçu: "${hostName}", hostName salle: "${room.hostName}"`)
+        return
+      }
       // Met à jour l'hostId avec le socket actuel
       room.hostId = socket.id
 
