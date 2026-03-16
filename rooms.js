@@ -119,7 +119,7 @@ function computeResults(roomId) {
     tally[targetId] = (tally[targetId] || 0) + 1
   }
 
-  // Trouve le joueur le plus voté
+  // Trouve le joueur le plus voté (en cas d'égalité, l'imposteur est considéré trouvé)
   let maxVotes = 0
   let accusedId = null
   for (const [playerId, count] of Object.entries(tally)) {
@@ -128,6 +128,13 @@ function computeResults(roomId) {
       accusedId = playerId
     }
   }
+
+  // En cas d'égalité, vérifie si l'imposteur fait partie des ex-aequo
+  const tiedPlayers = Object.entries(tally)
+    .filter(([, count]) => count === maxVotes)
+    .map(([id]) => id)
+  const impostorInTie = tiedPlayers.includes(room.impostorId)
+  if (impostorInTie) accusedId = room.impostorId
 
   const impostorFound = accusedId === room.impostorId
   const impostor = room.players.find(p => p.id === room.impostorId)
