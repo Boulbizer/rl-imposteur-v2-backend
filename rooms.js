@@ -4,28 +4,29 @@
 
 // Structure d'une salle :
 // {
-//   id: "abc123",           ← identifiant unique (aussi dans l'URL)
-//   hostId: "socket-id",   ← socket.id de l'hôte
+//   id: "t1710abc12",        ← préfixe temporel + aléatoire (anti-collision)
+//   hostId: "socket-id",     ← socket.id de l'hôte
 //   hostName: "Pseudo",
-//   players: [             ← liste de tous les joueurs
-//     { id: "socket-id", name: "Pseudo", ready: false }
+//   players: [
+//     { id: "socket-id", name: "Pseudo", disconnected: false }
 //   ],
-//   status: "lobby" | "playing" | "voting" | "reveal" | "scores",
-//   impostorId: null,      ← socket.id de l'imposteur (assigné au lancement)
-//   votes: {},             ← { voterId: targetId }
+//   status: "lobby" | "playing" | "voting" | "reveal",
+//   impostorId: null,
+//   votes: {},               ← { voterId: targetId }
 //   round: 1,
 // }
 
 const rooms = new Map()
 
-// Génère un ID de salle unique à 8 caractères
+// Génère un ID unique avec préfixe temporel pour éviter les collisions Supabase
 function generateRoomId() {
+  const timestamp = Date.now().toString(36) // base36 compact
   const chars = 'abcdefghijklmnopqrstuvwxyz0123456789'
-  let id = ''
-  for (let i = 0; i < 8; i++) {
-    id += chars[Math.floor(Math.random() * chars.length)]
+  let rand = ''
+  for (let i = 0; i < 4; i++) {
+    rand += chars[Math.floor(Math.random() * chars.length)]
   }
-  // S'assure que l'ID n'existe pas déjà
+  const id = `${timestamp}${rand}`
   if (rooms.has(id)) return generateRoomId()
   return id
 }
@@ -37,7 +38,7 @@ function createRoom(hostId, hostName) {
     id: roomId,
     hostId,
     hostName,
-    players: [{ id: hostId, name: hostName }],
+    players: [{ id: hostId, name: hostName, disconnected: false }],
     status: 'lobby',
     impostorId: null,
     votes: {},
@@ -54,15 +55,73 @@ function joinRoom(roomId, playerId, playerName) {
   if (room.status !== 'lobby') return { error: 'La partie a déjà commencé' }
   if (room.players.length >= 10) return { error: 'Salle pleine (10 joueurs max)' }
 
-  // Évite les doublons (reconnexion)
+  // Vérifie l'unicité du pseudo dans la salle
+  const nameTaken = room.players.find(
+    p => p.name.toLowerCase() === playerName.toLowerCase() && p.id !== playerId
+  )
+  if (nameTaken) return { error: 'Ce pseudo est déjà pris dans cette salle' }
+
+  // Évite les doublons (reconnexion au lobby)
   const exists = room.players.find(p => p.id === playerId)
   if (!exists) {
-    room.players.push({ id: playerId, name: playerName })
+    room.players.push({ id: playerId, name: playerName, disconnected: false })
   }
   return { room }
 }
 
-// Retire un joueur (déconnexion)
+// Marque un joueur comme déconnecté (sans le retirer)
+// Retourne les infos nécessaires pour gérer le timer de grâce
+function disconnectPlayer(playerId) {
+  for (const [roomId, room] of rooms.entries()) {
+    const player = room.players.find(p => p.id === playerId)
+    if (player) {
+      player.disconnected = true
+      return { roomId, room, playerName: player.name }
+    }
+  }
+  return null
+}
+
+// Reconnecte un joueur déconnecté (met à jour son socket.id)
+function rejoinPlayer(roomId, newSocketId, playerName) {
+  const room = rooms.get(roomId)
+  if (!room) return { error: 'Salle introuvable' }
+
+  const player = room.players.find(
+    p => p.name === playerName && p.disconnected
+  )
+  if (!player) return { error: 'Joueur non trouvé ou déjà connecté' }
+
+  const oldId = player.id
+  player.id = newSocketId
+  player.disconnected = false
+
+  // Met à jour hostId si ce joueur est l'hôte
+  if (room.hostId === oldId) {
+    room.hostId = newSocketId
+  }
+
+  // Met à jour impostorId si ce joueur est l'imposteur
+  if (room.impostorId === oldId) {
+    room.impostorId = newSocketId
+  }
+
+  // Met à jour les votes (clés = voterId)
+  if (room.votes[oldId] !== undefined) {
+    room.votes[newSocketId] = room.votes[oldId]
+    delete room.votes[oldId]
+  }
+  // Met à jour les votes (valeurs = targetId)
+  for (const [voterId, targetId] of Object.entries(room.votes)) {
+    if (targetId === oldId) {
+      room.votes[voterId] = newSocketId
+    }
+  }
+
+  return { room, isImpostor: room.impostorId === newSocketId }
+}
+
+// Retire définitivement un joueur (appelé après expiration du timer de grâce)
 function leaveRoom(playerId) {
   for (const [roomId, room] of rooms.entries()) {
     const index = room.players.findIndex(p => p.id === playerId)
@@ -75,11 +134,12 @@ function leaveRoom(playerId) {
         return { roomId, room: null, wasHost: false }
       }
 
-      // Si l'hôte part, on passe le rôle au prochain joueur
+      // Si l'hôte part, on passe le rôle au prochain joueur connecté
       const wasHost = room.hostId === playerId
       if (wasHost && room.players.length > 0) {
-        room.hostId = room.players[0].id
-        room.hostName = room.players[0].name
+        const nextHost = room.players.find(p => !p.disconnected) || room.players[0]
+        room.hostId = nextHost.id
+        room.hostName = nextHost.name
       }
 
       return { roomId, room, wasHost }
@@ -88,13 +148,16 @@ function leaveRoom(playerId) {
   return null
 }
 
-// Désigne aléatoirement l'imposteur parmi les joueurs
+// Désigne aléatoirement l'imposteur parmi les joueurs connectés
 function assignImpostor(roomId) {
   const room = rooms.get(roomId)
   if (!room || room.players.length < 2) return null
 
-  const randomIndex = Math.floor(Math.random() * room.players.length)
-  room.impostorId = room.players[randomIndex].id
+  const connected = room.players.filter(p => !p.disconnected)
+  if (connected.length < 2) return null
+
+  const randomIndex = Math.floor(Math.random() * connected.length)
+  room.impostorId = connected[randomIndex].id
   room.status = 'playing'
   return room
 }
@@ -188,6 +251,8 @@ module.exports = {
   createRoom,
   joinRoom,
   leaveRoom,
+  disconnectPlayer,
+  rejoinPlayer,
   assignImpostor,
   castVote,
   computeResults,

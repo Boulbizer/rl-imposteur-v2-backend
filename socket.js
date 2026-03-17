@@ -5,6 +5,8 @@ const {
   createRoom,
   joinRoom,
   leaveRoom,
+  disconnectPlayer,
+  rejoinPlayer,
   assignImpostor,
   castVote,
   computeResults,
@@ -12,6 +14,12 @@ const {
   getRoom,
 } = require('./rooms')
 const supabase = require('./lib/supabase')
+
+// Durée de grâce avant suppression définitive (30 secondes)
+const GRACE_PERIOD_MS = 30_000
+
+// Timers de grâce en cours : Map<socketId, { timerId, roomId }>
+const pendingDisconnects = new Map()
 
 // Sauvegarde les scores d'une manche dans Supabase
 async function saveScores(roomId, players, pointsAwarded) {
@@ -86,6 +94,48 @@ function registerSocketEvents(io) {
       console.log(`👤 ${playerName} a rejoint la salle ${roomId}`)
     })
 
+    // ─── RECONNEXION (grâce period) ─────────────────────────────────
+    socket.on('room:rejoin', ({ roomId, playerName }) => {
+      if (!playerName?.trim() || !roomId) return
+
+      const result = rejoinPlayer(roomId, socket.id, playerName.trim())
+      if (result.error) {
+        // Si rejoin échoue et qu'on est en lobby, tenter un join normal
+        const room = getRoom(roomId)
+        if (room && room.status === 'lobby') {
+          const joinResult = joinRoom(roomId, socket.id, playerName.trim())
+          if (joinResult.error) {
+            socket.emit('room:error', { message: joinResult.error })
+            return
+          }
+          socket.join(roomId)
+          socket.emit('room:joined', { room: joinResult.room })
+          socket.to(roomId).emit('room:updated', { room: joinResult.room })
+          return
+        }
+        socket.emit('room:error', { message: result.error })
+        return
+      }
+
+      // Annule le timer de grâce s'il existe pour cet ancien socket
+      for (const [oldSocketId, pending] of pendingDisconnects.entries()) {
+        if (pending.roomId === roomId && pending.playerName === playerName) {
+          clearTimeout(pending.timerId)
+          pendingDisconnects.delete(oldSocketId)
+          console.log(`🔄 Timer de grâce annulé pour ${playerName} (ancien: ${oldSocketId}, nouveau: ${socket.id})`)
+          break
+        }
+      }
+
+      socket.join(roomId)
+      socket.emit('room:rejoined', {
+        room: result.room,
+        isImpostor: result.isImpostor,
+      })
+      socket.to(roomId).emit('room:updated', { room: result.room })
+      console.log(`🔄 ${playerName} reconnecté dans la salle ${roomId} (nouveau socket: ${socket.id})`)
+    })
+
     // ─── LANCER LA PARTIE ──────────────────────────────────────────
     socket.on('game:start', ({ roomId }) => {
       const room = getRoom(roomId)
@@ -130,7 +180,9 @@ function registerSocketEvents(io) {
       if (!room) return
 
       const votesCount = Object.keys(room.votes).length
-      const totalPlayers = room.players.length
+      // Seuls les joueurs connectés doivent voter
+      const connectedPlayers = room.players.filter(p => !p.disconnected)
+      const totalPlayers = connectedPlayers.length
 
       io.to(roomId).emit('vote:registered', { votesCount, totalPlayers })
 
@@ -143,27 +195,22 @@ function registerSocketEvents(io) {
     })
 
     // ─── VOIR LES SCORES CUMULÉS ───────────────────────────────────
-    // MODIFIÉ : on renvoie aussi la room à jour pour que le frontend
-    // puisse recalculer amHost correctement (room.hostName fiable)
     socket.on('scores:request', async ({ roomId }) => {
       const scores = await getTotalScores(roomId)
       const room = getRoom(roomId)
       socket.emit('scores:data', { scores, room })
-      console.log(`📋 Scores demandés pour la salle ${roomId} — hôte : ${room?.hostName}`)
+      console.log(`📋 Scores demandés pour la salle ${roomId}`)
     })
 
     // ─── MANCHE SUIVANTE ───────────────────────────────────────────
-    socket.on('round:next', ({ roomId, hostName }) => {
+    // Sécurisé : vérification uniquement par socket.id
+    socket.on('round:next', ({ roomId }) => {
       const room = getRoom(roomId)
       if (!room) return
-      // Vérifie via socket.id OU via le nom de l'hôte (en cas de reconnexion)
-      const isHost = room.hostId === socket.id || room.hostName === hostName
-      if (!isHost) {
-        console.log(`⛔ round:next refusé — socket: ${socket.id}, hostId: ${room.hostId}, hostName reçu: "${hostName}", hostName salle: "${room.hostName}"`)
+      if (room.hostId !== socket.id) {
+        console.log(`⛔ round:next refusé — socket: ${socket.id}, hostId attendu: ${room.hostId}`)
         return
       }
-      // Met à jour l'hostId avec le socket actuel
-      room.hostId = socket.id
 
       const updatedRoom = nextRound(roomId)
       io.to(roomId).emit('round:next', { room: updatedRoom })
@@ -171,15 +218,45 @@ function registerSocketEvents(io) {
     })
 
     // ─── DÉCONNEXION ───────────────────────────────────────────────
+    // Période de grâce : le joueur est marqué déconnecté pendant 30s
+    // avant d'être définitivement retiré
     socket.on('disconnect', () => {
-      const result = leaveRoom(socket.id)
-      if (result?.roomId && result.room) {
-        io.to(result.roomId).emit('room:updated', { room: result.room })
-        if (result.wasHost) {
-          io.to(result.roomId).emit('host:changed', { newHostId: result.room.hostId })
-        }
+      const info = disconnectPlayer(socket.id)
+      if (!info) {
+        console.log(`❌ Déconnecté (hors salle) : ${socket.id}`)
+        return
       }
-      console.log(`❌ Déconnecté : ${socket.id}`)
+
+      const { roomId, room, playerName } = info
+
+      // Notifie les autres joueurs du statut déconnecté
+      io.to(roomId).emit('room:updated', { room })
+      console.log(`⏳ ${playerName} déconnecté — grâce de ${GRACE_PERIOD_MS / 1000}s (salle ${roomId})`)
+
+      // Lance le timer de grâce
+      const timerId = setTimeout(() => {
+        pendingDisconnects.delete(socket.id)
+
+        // Vérifie que le joueur est toujours marqué déconnecté
+        const currentRoom = getRoom(roomId)
+        if (!currentRoom) return
+        const player = currentRoom.players.find(p => p.id === socket.id)
+        if (!player || !player.disconnected) return
+
+        // Suppression définitive
+        const result = leaveRoom(socket.id)
+        if (result?.roomId && result.room) {
+          io.to(result.roomId).emit('room:updated', { room: result.room })
+          if (result.wasHost) {
+            io.to(result.roomId).emit('host:changed', { newHostId: result.room.hostId })
+          }
+          console.log(`❌ ${playerName} définitivement retiré après grâce (salle ${roomId})`)
+        } else if (result?.roomId && !result.room) {
+          console.log(`🗑️ Salle ${roomId} supprimée (vide après départ de ${playerName})`)
+        }
+      }, GRACE_PERIOD_MS)
+
+      pendingDisconnects.set(socket.id, { timerId, roomId, playerName })
     })
   })
 }
