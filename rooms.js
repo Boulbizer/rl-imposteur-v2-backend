@@ -55,17 +55,28 @@ function joinRoom(roomId, playerId, playerName) {
   if (room.status !== 'lobby') return { error: 'La partie a déjà commencé' }
   if (room.players.length >= 10) return { error: 'Salle pleine (10 joueurs max)' }
 
-  // Vérifie l'unicité du pseudo dans la salle
-  const nameTaken = room.players.find(
-    p => p.name.toLowerCase() === playerName.toLowerCase() && p.id !== playerId
+  // Vérifie si le joueur existe déjà avec le même pseudo (reconnexion avec nouveau socket.id)
+  const existingByName = room.players.find(
+    p => p.name.toLowerCase() === playerName.toLowerCase()
   )
-  if (nameTaken) return { error: 'Ce pseudo est déjà pris dans cette salle' }
-
-  // Évite les doublons (reconnexion au lobby)
-  const exists = room.players.find(p => p.id === playerId)
-  if (!exists) {
-    room.players.push({ id: playerId, name: playerName, disconnected: false })
+  if (existingByName) {
+    if (existingByName.id === playerId) {
+      // Même socket.id, rien à faire
+      existingByName.disconnected = false
+      return { room }
+    }
+    // Pseudo existant avec un ancien socket.id → reconnexion implicite
+    const oldId = existingByName.id
+    existingByName.id = playerId
+    existingByName.disconnected = false
+    // Met à jour hostId si nécessaire
+    if (room.hostId === oldId) room.hostId = playerId
+    if (room.impostorId === oldId) room.impostorId = playerId
+    return { room }
   }
+
+  // Nouveau joueur
+  room.players.push({ id: playerId, name: playerName, disconnected: false })
   return { room }
 }
 
