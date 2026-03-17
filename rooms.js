@@ -229,6 +229,7 @@ function computeResults(roomId) {
     tally,
     pointsAwarded,
     players: room.players,
+    votes: { ...room.votes },
   }
 }
 
