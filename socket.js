@@ -189,6 +189,9 @@ function registerSocketEvents(io) {
       if (votesCount >= totalPlayers) {
         const results = computeResults(roomId)
         await saveScores(roomId, results.players, results.pointsAwarded)
+        // Récupère les scores cumulés pour les inclure dans les résultats
+        const cumulativeScores = await getTotalScores(roomId)
+        results.cumulativeScores = cumulativeScores
         io.to(roomId).emit('reveal:result', { results })
         console.log(`📊 Résultats calculés pour la salle ${roomId}`)
       }
