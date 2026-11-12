@@ -7,26 +7,30 @@ const http = require('http')
 const { Server } = require('socket.io')
 const { registerSocketEvents } = require('./socket')
 
-const app = express()
-const server = http.createServer(app)
+function createServer({ frontendUrl = process.env.FRONTEND_URL || 'http://localhost:5173' } = {}) {
+  const app = express()
+  const server = http.createServer(app)
 
-// Configuration Socket.io avec CORS pour autoriser le frontend
-const io = new Server(server, {
-  cors: {
-    origin: process.env.FRONTEND_URL || 'http://localhost:5173',
-    methods: ['GET', 'POST'],
-  },
-})
+  // Configuration Socket.io avec CORS pour autoriser le frontend
+  const io = new Server(server, {
+    cors: { origin: frontendUrl, methods: ['GET', 'POST'] },
+  })
 
-// Route de santé (Railway et toi pouvez vérifier que le serveur tourne)
-app.get('/', (req, res) => {
-  res.json({ status: 'ok', message: 'RL Imposteur 2.0 — Backend opérationnel 🚀' })
-})
+  // Route de santé
+  app.get('/', (req, res) => {
+    res.json({ status: 'ok', message: 'RL Imposteur 2.0 — Backend opérationnel 🚀' })
+  })
 
-// Enregistre tous les événements Socket.io
-registerSocketEvents(io)
+  registerSocketEvents(io)
+  return { app, server, io }
+}
 
-const PORT = process.env.PORT || 3001
-server.listen(PORT, () => {
-  console.log(`🚀 Serveur lancé sur http://localhost:${PORT}`)
-})
+if (require.main === module) {
+  const { server } = createServer()
+  const PORT = process.env.PORT || 3001
+  server.listen(PORT, () => {
+    console.log(`🚀 Serveur lancé sur http://localhost:${PORT}`)
+  })
+}
+
+module.exports = { createServer }
