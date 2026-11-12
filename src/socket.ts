@@ -84,12 +84,18 @@ export class GameSockets {
     if (!engine.allVoted(room)) return
     const results = engine.reveal(room, this.now())
     const persisted = this.registry.persist(room)
-    await this.registry.storage.addScores(room.players.map(p => ({
-      room_id: room.scoreKey,
-      player_name: p.name,
-      points: results.pointsAwarded[p.id] ?? 0,
-    })))
-    results.cumulativeScores = await this.registry.storage.totalScores(room.scoreKey)
+    // Les scores ne doivent jamais bloquer la révélation : en cas de panne du
+    // stockage, on révèle quand même (sans cumul).
+    try {
+      await this.registry.storage.addScores(room.players.map(p => ({
+        room_id: room.scoreKey,
+        player_name: p.name,
+        points: results.pointsAwarded[p.id] ?? 0,
+      })))
+      results.cumulativeScores = await this.registry.storage.totalScores(room.scoreKey)
+    } catch (err) {
+      console.error(`Scores de la salle ${room.id} non enregistrés :`, err)
+    }
     await persisted
     this.io.to(room.id).emit('reveal:result', { results, room: engine.publicRoom(room) })
   }

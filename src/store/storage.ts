@@ -97,6 +97,8 @@ export class SupabaseStorage implements Storage {
 export class FileStorage implements Storage {
   private memory = new MemoryStorage()
   private loaded = false
+  /** Les écritures du fichier sont sérialisées : jamais deux à la fois. */
+  private queue: Promise<void> = Promise.resolve()
 
   constructor(private path: string) {}
 
@@ -113,12 +115,16 @@ export class FileStorage implements Storage {
     }
   }
 
-  private async write() {
-    const { writeFile, rename } = await import('node:fs/promises')
-    const data = { rooms: await this.memory.loadRooms(), scores: this.memory.allScores() }
-    const tmp = `${this.path}.tmp`
-    await writeFile(tmp, JSON.stringify(data))
-    await rename(tmp, this.path)
+  private write(): Promise<void> {
+    const run = async () => {
+      const { writeFile, rename } = await import('node:fs/promises')
+      const data = { rooms: await this.memory.loadRooms(), scores: this.memory.allScores() }
+      const tmp = `${this.path}.tmp`
+      await writeFile(tmp, JSON.stringify(data))
+      await rename(tmp, this.path)
+    }
+    this.queue = this.queue.then(run, run)
+    return this.queue
   }
 
   async loadRooms() { await this.load(); return this.memory.loadRooms() }

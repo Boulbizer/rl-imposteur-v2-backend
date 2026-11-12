@@ -1,6 +1,9 @@
 // Tests d'intégration : vrais sockets contre un vrai serveur sur un port libre.
 import { test, describe, before, after } from 'node:test'
 import assert from 'node:assert/strict'
+import { mkdtemp } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import type { AddressInfo } from 'node:net'
 import { io as connect, type Socket } from 'socket.io-client'
 import { createServer } from '../src/server'
@@ -225,9 +228,6 @@ describe('redémarrage du serveur', () => {
 
 describe('stockage fichier', () => {
   test('une salle sauvegardée est relue par une nouvelle instance', async () => {
-    const { mkdtemp } = await import('node:fs/promises')
-    const { tmpdir } = await import('node:os')
-    const { join } = await import('node:path')
     const file = join(await mkdtemp(join(tmpdir(), 'rl-')), 'rooms.json')
     const a = new FileStorage(file)
     await a.saveRoom({
@@ -238,5 +238,32 @@ describe('stockage fichier', () => {
     const b = new FileStorage(file)
     assert.equal((await b.loadRooms())[0].round, 3)
     assert.deepEqual(await b.totalScores('k'), [{ name: 'H', total: 2 }])
+  })
+})
+
+describe('résilience', () => {
+  test('une panne du stockage des scores ne bloque pas la révélation', async () => {
+    const storage = new MemoryStorage()
+    storage.addScores = async () => { throw new Error('base indisponible') }
+    const srv = await startServer(storage)
+    const { code, players } = await setupRoom(srv.url, ['A', 'B'])
+    await startAndVote(code, players)
+    const reveal = once(players[0].c, 'reveal:result')
+    players[0].c.emit('vote:cast', { roomId: code, targetId: players[1].you.playerId })
+    players[1].c.emit('vote:cast', { roomId: code, targetId: players[0].you.playerId })
+    const { results } = await reveal
+    assert.equal(results.cumulativeScores, undefined)
+    players.forEach(p => p.c.close())
+    await srv.close()
+    await new Promise(r => srv.server.close(r))
+  })
+
+  test('stockage fichier : écritures simultanées sans erreur', async () => {
+    const file = join(await mkdtemp(join(tmpdir(), 'rl-')), 'rooms.json')
+    const fs = new FileStorage(file)
+    const base = { scoreKey: 'k', hostId: 'h', hostName: 'H', players: [], status: 'lobby' as const,
+      impostorId: null, votes: {}, round: 1, updatedAt: Date.now() }
+    await Promise.all(Array.from({ length: 20 }, (_, i) => fs.saveRoom({ ...base, id: `R${i}` })))
+    assert.equal((await new FileStorage(file).loadRooms()).length, 20)
   })
 })
