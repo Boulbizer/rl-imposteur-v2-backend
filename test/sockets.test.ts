@@ -4,7 +4,7 @@ import assert from 'node:assert/strict'
 import type { AddressInfo } from 'node:net'
 import { io as connect, type Socket } from 'socket.io-client'
 import { createServer } from '../src/server'
-import { MemoryStorage } from '../src/store/storage'
+import { FileStorage, MemoryStorage } from '../src/store/storage'
 import type { ClientToServerEvents, PrivateView, PublicRoom, ServerToClientEvents } from '../src/types'
 
 type Client = Socket<ServerToClientEvents, ClientToServerEvents> & { received: { event: string; payload: unknown }[] }
@@ -220,5 +220,23 @@ describe('redémarrage du serveur', () => {
     assert.equal(srv.registry.get('VIEU'), undefined)
     assert.equal((await storage.loadRooms()).length, 0)
     await srv.close()
+  })
+})
+
+describe('stockage fichier', () => {
+  test('une salle sauvegardée est relue par une nouvelle instance', async () => {
+    const { mkdtemp } = await import('node:fs/promises')
+    const { tmpdir } = await import('node:os')
+    const { join } = await import('node:path')
+    const file = join(await mkdtemp(join(tmpdir(), 'rl-')), 'rooms.json')
+    const a = new FileStorage(file)
+    await a.saveRoom({
+      id: 'FICH', scoreKey: 'k', hostId: 'h', hostName: 'H', players: [], status: 'lobby',
+      impostorId: null, votes: {}, round: 3, updatedAt: Date.now(),
+    })
+    await a.addScores([{ room_id: 'k', player_name: 'H', points: 2 }])
+    const b = new FileStorage(file)
+    assert.equal((await b.loadRooms())[0].round, 3)
+    assert.deepEqual(await b.totalScores('k'), [{ name: 'H', total: 2 }])
   })
 })

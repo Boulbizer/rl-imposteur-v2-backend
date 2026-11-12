@@ -48,6 +48,9 @@ export class MemoryStorage implements Storage {
   async totalScores(scoreKey: string): Promise<ScoreLine[]> {
     return aggregate(this.scores.filter(r => r.room_id === scoreKey))
   }
+  allScores(): ScoreRow[] {
+    return [...this.scores]
+  }
 }
 
 export class SupabaseStorage implements Storage {
@@ -85,4 +88,42 @@ export class SupabaseStorage implements Storage {
     }
     return aggregate(data ?? [])
   }
+}
+
+/**
+ * Stockage dans un fichier JSON local : développement sans Supabase et tests
+ * de redémarrage (le fichier survit au processus). Pas pour la production.
+ */
+export class FileStorage implements Storage {
+  private memory = new MemoryStorage()
+  private loaded = false
+
+  constructor(private path: string) {}
+
+  private async load() {
+    if (this.loaded) return
+    this.loaded = true
+    const { readFile } = await import('node:fs/promises')
+    try {
+      const data = JSON.parse(await readFile(this.path, 'utf8')) as { rooms: Room[]; scores: ScoreRow[] }
+      for (const room of data.rooms) await this.memory.saveRoom(room)
+      await this.memory.addScores(data.scores)
+    } catch {
+      // fichier absent ou illisible : on part de zéro
+    }
+  }
+
+  private async write() {
+    const { writeFile, rename } = await import('node:fs/promises')
+    const data = { rooms: await this.memory.loadRooms(), scores: this.memory.allScores() }
+    const tmp = `${this.path}.tmp`
+    await writeFile(tmp, JSON.stringify(data))
+    await rename(tmp, this.path)
+  }
+
+  async loadRooms() { await this.load(); return this.memory.loadRooms() }
+  async saveRoom(room: Room) { await this.load(); await this.memory.saveRoom(room); await this.write() }
+  async deleteRoom(code: string) { await this.load(); await this.memory.deleteRoom(code); await this.write() }
+  async addScores(rows: ScoreRow[]) { await this.load(); await this.memory.addScores(rows); await this.write() }
+  async totalScores(scoreKey: string) { await this.load(); return this.memory.totalScores(scoreKey) }
 }
