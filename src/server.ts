@@ -5,6 +5,7 @@ import 'dotenv/config'
 import http from 'node:http'
 import express from 'express'
 import { Server } from 'socket.io'
+import { missionProviderFromEnv, type MissionProvider } from './game/missions'
 import { GameSockets } from './socket'
 import { RoomRegistry } from './store/registry'
 import type { Storage } from './store/storage'
@@ -13,6 +14,8 @@ import type { ClientToServerEvents, ServerToClientEvents } from './types'
 
 export interface ServerOptions {
   storage?: Storage
+  /** Générateur de missions (Claude + banque locale par défaut). */
+  missions?: MissionProvider
   frontendUrl?: string
   /** Délai de grâce après une déconnexion (30 s par défaut). */
   graceMs?: number
@@ -37,9 +40,11 @@ export async function createServer(opts: ServerOptions = {}) {
 
   const registry = new RoomRegistry(storage)
   const restored = await registry.restore(Date.now(), maxRoomAgeMs)
-  const sockets = new GameSockets(io, registry, { graceMs })
+  const missions = opts.missions ?? missionProviderFromEnv()
+  const sockets = new GameSockets(io, registry, { graceMs, missions })
   for (const room of restored) {
     for (const player of room.players) sockets.scheduleRemoval(room, player, restartGraceMs)
+    sockets.schedulePhase(room)
   }
   if (restored.length) console.log(`♻️  ${restored.length} salle(s) restaurée(s)`)
 

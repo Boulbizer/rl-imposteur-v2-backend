@@ -8,6 +8,8 @@ import type { AddressInfo } from 'node:net'
 import { io as connect, type Socket } from 'socket.io-client'
 import { createServer } from '../src/server'
 import { FileStorage, MemoryStorage } from '../src/store/storage'
+import { OfflineMissionProvider } from '../src/game/missions'
+import { DEFAULT_SETTINGS } from '../src/game/engine'
 import type { ClientToServerEvents, PrivateView, PublicRoom, ServerToClientEvents } from '../src/types'
 
 type Client = Socket<ServerToClientEvents, ClientToServerEvents> & { received: { event: string; payload: unknown }[] }
@@ -16,7 +18,7 @@ type Joined = { room: PublicRoom } & PrivateView
 const clients: Client[] = []
 
 async function startServer(storage = new MemoryStorage(), restartGraceMs = 5_000) {
-  const srv = await createServer({ storage, graceMs: 300, restartGraceMs })
+  const srv = await createServer({ storage, graceMs: 300, restartGraceMs, missions: new OfflineMissionProvider() })
   await new Promise<void>(r => srv.server.listen(0, r))
   const url = `http://localhost:${(srv.server.address() as AddressInfo).port}`
   return { ...srv, url, storage }
@@ -56,8 +58,12 @@ async function startAndVote(code: string, players: Awaited<ReturnType<typeof set
   const started = Promise.all(players.map(p => once<{ isImpostor: boolean }>(p.c, 'game:started')))
   players[0].c.emit('game:start', { roomId: code })
   const roles = await started
-  const voting = Promise.all(players.map(p => once(p.c, 'voting:started')))
+  // Fin du match → débat (60 s par défaut), écourté par l'hôte → vote
+  const debate = Promise.all(players.map(p => once(p.c, 'debate:started')))
   players[0].c.emit('game:end', { roomId: code })
+  await debate
+  const voting = Promise.all(players.map(p => once(p.c, 'voting:started')))
+  players[0].c.emit('debate:skip', { roomId: code })
   await voting
   return roles
 }
@@ -87,6 +93,7 @@ describe('serveur', () => {
       for (const { event, payload } of p.c.received) {
         const json = JSON.stringify(payload)
         assert.ok(!json.includes('impostorId'), `${event} contient impostorId`)
+        assert.ok(!json.includes('"missions"') && !json.includes('"roles"'), `${event} contient les rôles ou missions de tous`)
         for (const other of players) {
           if (other !== p) assert.ok(!json.includes(other.you.token), `${event} contient un jeton`)
         }
@@ -218,8 +225,9 @@ describe('redémarrage du serveur', () => {
     await storage.saveRoom({
       id: 'VIEU', scoreKey: 'k', hostId: 'h', hostName: 'H', players: [], status: 'lobby',
       impostorId: null, votes: {}, round: 1, updatedAt: Date.now() - 13 * 3600_000,
+      roles: {}, missions: {}, clues: {}, accusations: [], settings: DEFAULT_SETTINGS, phaseEndsAt: null,
     })
-    const srv = await createServer({ storage })
+    const srv = await createServer({ storage, missions: new OfflineMissionProvider() })
     assert.equal(srv.registry.get('VIEU'), undefined)
     assert.equal((await storage.loadRooms()).length, 0)
     await srv.close()
@@ -233,6 +241,7 @@ describe('stockage fichier', () => {
     await a.saveRoom({
       id: 'FICH', scoreKey: 'k', hostId: 'h', hostName: 'H', players: [], status: 'lobby',
       impostorId: null, votes: {}, round: 3, updatedAt: Date.now(),
+      roles: {}, missions: {}, clues: {}, accusations: [], settings: DEFAULT_SETTINGS, phaseEndsAt: null,
     })
     await a.addScores([{ room_id: 'k', player_name: 'H', points: 2 }])
     const b = new FileStorage(file)
@@ -262,8 +271,111 @@ describe('résilience', () => {
     const file = join(await mkdtemp(join(tmpdir(), 'rl-')), 'rooms.json')
     const fs = new FileStorage(file)
     const base = { scoreKey: 'k', hostId: 'h', hostName: 'H', players: [], status: 'lobby' as const,
-      impostorId: null, votes: {}, round: 1, updatedAt: Date.now() }
+      impostorId: null, votes: {}, round: 1, updatedAt: Date.now(),
+      roles: {}, missions: {}, clues: {}, accusations: [], settings: DEFAULT_SETTINGS, phaseEndsAt: null }
     await Promise.all(Array.from({ length: 20 }, (_, i) => fs.saveRoom({ ...base, id: `R${i}` })))
     assert.equal((await new FileStorage(file).loadRooms()).length, 20)
+  })
+})
+
+describe('étape 3 : rôles, missions, débat, chronos', () => {
+  let srv: Awaited<ReturnType<typeof startServer>>
+  before(async () => { srv = await startServer() })
+  after(async () => {
+    clients.forEach(c => c.close())
+    await srv.close()
+    await new Promise(r => srv.server.close(r))
+  })
+
+  test('chacun reçoit en privé son rôle et sa mission ; le Détective un indice', async () => {
+    const { code, players } = await setupRoom(srv.url, ['A', 'B', 'C', 'D', 'E'])
+    const started = Promise.all(players.map(p => once(p.c, 'game:started')))
+    players[0].c.emit('game:start', { roomId: code })
+    const views = await started
+    assert.deepEqual(views.map(v => v.role).sort(), ['detective', 'impostor', 'jester', 'teammate', 'teammate'])
+    views.forEach((v, i) => {
+      assert.equal(v.you.playerId, players[i].you.playerId)
+      assert.ok(v.mission && v.mission.length > 10, 'mission reçue')
+      assert.equal(v.isImpostor, v.role === 'impostor')
+      assert.equal(!!v.clue, v.role === 'detective')
+    })
+  })
+
+  test("réglages : l'hôte les change, tout le monde les voit ; refusés pour les autres", async () => {
+    const { code, players } = await setupRoom(srv.url, ['H', 'G'])
+    const seen = once(players[1].c, 'room:updated')
+    players[0].c.emit('room:settings', { roomId: code, settings: { mode: 'rumble', jester: false } })
+    const { room } = await seen
+    assert.equal(room.settings.mode, 'rumble')
+    assert.equal(room.settings.jester, false)
+    players[1].c.emit('room:settings', { roomId: code, settings: { mode: 'hoops' } })
+    assert.match((await once(players[1].c, 'room:error')).message, /hôte/)
+  })
+
+  test('débat : les accusations sont diffusées à toute la salle', async () => {
+    const { code, players } = await setupRoom(srv.url, ['H', 'X', 'Y'])
+    const started = Promise.all(players.map(p => once(p.c, 'game:started')))
+    players[0].c.emit('game:start', { roomId: code })
+    await started
+    const debate = once(players[2].c, 'debate:started')
+    players[0].c.emit('game:end', { roomId: code })
+    const { room } = await debate
+    assert.ok(room.phaseEndsAt > Date.now())
+    const update = once(players[2].c, 'room:updated')
+    players[1].c.emit('debate:accuse', { roomId: code, targetId: players[0].you.playerId, reason: 'Il a fui le kickoff' })
+    const updated = (await update).room
+    assert.deepEqual(updated.accusations, [{ fromId: players[1].you.playerId, targetId: players[0].you.playerId, reason: 'Il a fui le kickoff' }])
+    players[1].c.emit('debate:skip', { roomId: code })
+    assert.match((await once(players[1].c, 'room:error')).message, /hôte/)
+  })
+
+  test('chronos : fin du débat → vote, fin du vote → révélation avec les votes émis', async () => {
+    const { code, players } = await setupRoom(srv.url, ['H', 'X', 'Y'])
+    players[0].c.emit('room:settings', { roomId: code, settings: { debateSeconds: 1, voteSeconds: 1 } })
+    await once(players[1].c, 'room:updated')
+    const started = Promise.all(players.map(p => once(p.c, 'game:started')))
+    players[0].c.emit('game:start', { roomId: code })
+    await started
+    const voting = once(players[1].c, 'voting:started', 3000)
+    players[0].c.emit('game:end', { roomId: code })
+    await voting
+    const reveal = once(players[1].c, 'reveal:result', 3000)
+    players[1].c.emit('vote:cast', { roomId: code, targetId: players[2].you.playerId }) // 1 vote sur 3
+    const { results } = await reveal
+    assert.equal(Object.keys(results.votes).length, 1)
+    assert.equal(Object.keys(results.roles).length, 3)
+    assert.equal(Object.keys(results.missions).length, 3)
+  })
+
+  test('redémarrage pendant le débat : chrono reprogrammé, rôle et mission restitués', async () => {
+    const storage = new MemoryStorage()
+    const first = await startServer(storage)
+    const { code, players } = await setupRoom(first.url, ['H', 'X'])
+    players[0].c.emit('room:settings', { roomId: code, settings: { debateSeconds: 2 } })
+    await once(players[1].c, 'room:updated')
+    const started = Promise.all(players.map(p => once(p.c, 'game:started')))
+    players[0].c.emit('game:start', { roomId: code })
+    const views = await started
+    const debate = once(players[1].c, 'debate:started')
+    players[0].c.emit('game:end', { roomId: code })
+    await debate
+
+    players.forEach(p => p.c.close())
+    await first.close()
+    await new Promise(r => first.server.close(r))
+    const second = await startServer(storage)
+    const back = []
+    for (const [i, p] of players.entries()) {
+      const c = client(second.url)
+      c.emit('room:rejoin', { roomId: code, token: p.you.token })
+      const data = await once(c, 'room:rejoined')
+      assert.equal(data.role, views[i].role)
+      assert.equal(data.mission, views[i].mission)
+      back.push(c)
+    }
+    await once(back[0], 'voting:started', 4000) // le chrono du débat a survécu au redémarrage
+    back.forEach(c => c.close())
+    await second.close()
+    await new Promise(r => second.server.close(r))
   })
 })

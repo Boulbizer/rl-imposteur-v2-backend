@@ -3,7 +3,7 @@
 // stockage, pour qu'un redémarrage du serveur ne tue aucune partie.
 
 import crypto from 'node:crypto'
-import { normalizeCode, randomCode, type RandomInt, cryptoRandomInt } from '../game/engine'
+import { normalizeCode, randomCode, upgradeRoom, type RandomInt, cryptoRandomInt } from '../game/engine'
 import type { Player, Room } from '../types'
 import type { Storage } from './storage'
 
@@ -21,7 +21,7 @@ export class RoomRegistry {
    */
   async restore(now: number, maxAgeMs: number): Promise<Room[]> {
     const restored: Room[] = []
-    for (const room of await this.storage.loadRooms()) {
+    for (const room of (await this.storage.loadRooms()).map(upgradeRoom)) {
       if (now - room.updatedAt > maxAgeMs) {
         await this.storage.deleteRoom(room.id)
         continue

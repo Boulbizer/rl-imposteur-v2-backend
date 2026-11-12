@@ -7,6 +7,7 @@
 
 import type { Server, Socket } from 'socket.io'
 import * as engine from './game/engine'
+import type { MissionProvider } from './game/missions'
 import type { RoomRegistry } from './store/registry'
 import type { ClientToServerEvents, Player, Room, ServerToClientEvents } from './types'
 
@@ -16,11 +17,14 @@ type ClientSocket = Socket<ClientToServerEvents, ServerToClientEvents>
 export interface GameServerOptions {
   /** Délai avant retrait d'un joueur déconnecté. */
   graceMs: number
+  missions: MissionProvider
   now?: () => number
 }
 
 export class GameSockets {
   private pendingRemovals = new Map<string, NodeJS.Timeout>()
+  /** Chrono de la phase en cours (débat ou vote), par salle. */
+  private phaseTimers = new Map<string, NodeJS.Timeout>()
   private now: () => number
 
   constructor(private io: IO, private registry: RoomRegistry, private opts: GameServerOptions) {
@@ -67,7 +71,7 @@ export class GameSockets {
       void this.registry.persist(room)
       this.broadcast(room)
       if (result.wasHost) this.io.to(room.id).emit('host:changed', { newHostId: room.hostId })
-      void this.finishVoteIfComplete(room)
+      void this.finishVote(room)
     }, delayMs)
     timer.unref()
     this.pendingRemovals.set(player.id, timer)
@@ -76,12 +80,49 @@ export class GameSockets {
   stopTimers() {
     for (const timer of this.pendingRemovals.values()) clearTimeout(timer)
     this.pendingRemovals.clear()
+    for (const timer of this.phaseTimers.values()) clearTimeout(timer)
+    this.phaseTimers.clear()
+  }
+
+  // ─── Phases chronométrées ──────────────────────────────────────
+
+  /** (Re)programme la fin de la phase en cours d'après room.phaseEndsAt. */
+  schedulePhase(room: Room) {
+    const existing = this.phaseTimers.get(room.id)
+    if (existing) clearTimeout(existing)
+    this.phaseTimers.delete(room.id)
+    if (room.phaseEndsAt === null || (room.status !== 'debate' && room.status !== 'voting')) return
+
+    const status = room.status
+    const endsAt = room.phaseEndsAt
+    const timer = setTimeout(() => {
+      this.phaseTimers.delete(room.id)
+      if (this.registry.get(room.id) !== room || room.status !== status || room.phaseEndsAt !== endsAt) return
+      if (status === 'debate') void this.openVoting(room, null)
+      else void this.finishVote(room, true)
+    }, Math.max(0, endsAt - this.now()))
+    timer.unref()
+    this.phaseTimers.set(room.id, timer)
+  }
+
+  private async openVoting(room: Room, actorId: string | null) {
+    const result = engine.startVoting(room, actorId, this.now())
+    if (!result.ok) return result
+    await this.registry.persist(room)
+    this.schedulePhase(room)
+    this.io.to(room.id).emit('voting:started', { room: engine.publicRoom(room) })
+    return result
   }
 
   // ─── Fin de vote ───────────────────────────────────────────────
 
-  private async finishVoteIfComplete(room: Room) {
-    if (!engine.allVoted(room)) return
+  /** Révèle si tout le monde a voté, ou sans condition à la fin du chrono (`force`). */
+  private async finishVote(room: Room, force = false) {
+    if (room.status !== 'voting') return
+    if (!force && !engine.allVoted(room)) return
+    const timer = this.phaseTimers.get(room.id)
+    if (timer) clearTimeout(timer)
+    this.phaseTimers.delete(room.id)
     const results = engine.reveal(room, this.now())
     const persisted = this.registry.persist(room)
     // Les scores ne doivent jamais bloquer la révélation : en cas de panne du
@@ -159,15 +200,33 @@ export class GameSockets {
       this.sendJoin(socket, 'room:rejoined', room, result.player)
     })
 
+    socket.on('room:settings', async ({ roomId, settings } = { roomId: '', settings: {} }) => {
+      const m = member(roomId)
+      if (!m) return
+      const result = engine.updateSettings(m.room, m.player.id, settings, this.now())
+      if (!result.ok) return this.error(socket, result.error)
+      await this.registry.persist(m.room)
+      this.broadcast(m.room)
+    })
+
     socket.on('game:start', async ({ roomId } = { roomId: '' }) => {
       const m = member(roomId)
       if (!m) return
-      const result = engine.start(m.room, m.player.id, this.now())
+      const { room } = m
+      const result = engine.start(room, m.player.id, this.now())
       if (!result.ok) return this.error(socket, result.error)
-      await this.registry.persist(m.room)
-      const room = engine.publicRoom(m.room)
-      for (const p of m.room.players) {
-        if (p.socketId) this.io.to(p.socketId).emit('game:started', { room, isImpostor: p.id === m.room.impostorId })
+
+      // Missions : Claude (ou banque locale) — sans aucun pseudo
+      const slots = engine.missionSlots(room)
+      const round = room.round
+      const texts = await this.opts.missions.generate({ mode: room.settings.mode, roles: slots.map(s => s.role) })
+      if (room.status !== 'playing' || room.round !== round) return // manche annulée entre-temps
+      engine.assignMissions(room, Object.fromEntries(slots.map((s, i) => [s.playerId, texts[i]])), this.now())
+
+      await this.registry.persist(room)
+      const pub = engine.publicRoom(room)
+      for (const p of room.players) {
+        if (p.socketId) this.io.to(p.socketId).emit('game:started', { room: pub, ...engine.privateView(room, p) })
       }
     })
 
@@ -177,7 +236,26 @@ export class GameSockets {
       const result = engine.endMatch(m.room, m.player.id, this.now())
       if (!result.ok) return this.error(socket, result.error)
       await this.registry.persist(m.room)
-      this.io.to(m.room.id).emit('voting:started', { room: engine.publicRoom(m.room) })
+      this.schedulePhase(m.room)
+      const room = engine.publicRoom(m.room)
+      if (result.next === 'debate') this.io.to(m.room.id).emit('debate:started', { room })
+      else this.io.to(m.room.id).emit('voting:started', { room })
+    })
+
+    socket.on('debate:accuse', async ({ roomId, targetId, reason } = { roomId: '', targetId: '', reason: '' }) => {
+      const m = member(roomId)
+      if (!m) return
+      const result = engine.accuse(m.room, m.player.id, targetId, reason, this.now())
+      if (!result.ok) return this.error(socket, result.error)
+      await this.registry.persist(m.room)
+      this.broadcast(m.room)
+    })
+
+    socket.on('debate:skip', async ({ roomId } = { roomId: '' }) => {
+      const m = member(roomId)
+      if (!m) return
+      const result = await this.openVoting(m.room, m.player.id)
+      if (result && !result.ok) this.error(socket, result.error)
     })
 
     socket.on('vote:cast', async ({ roomId, targetId } = { roomId: '', targetId: '' }) => {
@@ -191,7 +269,7 @@ export class GameSockets {
         totalPlayers: pub.players.filter(p => !p.disconnected).length,
       })
       this.broadcast(m.room)
-      if (engine.allVoted(m.room)) await this.finishVoteIfComplete(m.room)
+      if (engine.allVoted(m.room)) await this.finishVote(m.room)
       else await this.registry.persist(m.room)
     })
 
@@ -218,7 +296,7 @@ export class GameSockets {
       engine.markDisconnected(room, player.id, this.now())
       void this.registry.persist(room)
       this.broadcast(room)
-      void this.finishVoteIfComplete(room)
+      void this.finishVote(room)
       this.scheduleRemoval(room, player, this.opts.graceMs)
     })
   }
